@@ -1,51 +1,96 @@
-// btc-cent-forecast-01 entry (Node 22, standard library only): a mild
-// two-signal mean-reversion ensemble that forecasts Bitcoin's price 240
-// minutes after each checkpoint, from the 4,320 one-minute closes up to it.
+// btc-cent-forecast-01 entry (Node 22, standard library only): an asymmetric
+// mean-reversion ensemble that forecasts Bitcoin's price 240 minutes after
+// each checkpoint, from the 4,320 one-minute closes up to it.
 //
 //   guess = (trend + pull) / 2, kept on the price grid's 5 decimals
-//     trend = last * exp(-0.10 * log(last / close 240 minutes ago))
-//     pull  = last + 0.10 * (EMA(720) - last)
+//     trend = last * exp(-damp * log(last / close 240 minutes ago)),
+//             damp = 0.35 after a rise, 0.00 after a fall
+//     pull  = last + 0.10 * min(0, EMA(720) - last)   (downward only)
 //
 // Why this shape: absolute error is a proper scoring rule for one number,
 // so the best guess is the conditional median of the price 4 hours out.
 // At a 4-hour horizon Bitcoin's 1-minute returns are close to a random
 // walk, so the persistence guess (the checkpoint's own close) is already
-// strong, and any big directional bet is a coin flip that loses in the
-// trending regime. What survives validation on both samples below is only
-// a small pull back toward where the price just came from:
+// strong, and any big directional bet is a coin flip. What survives
+// validation on every sample below is only a small, one-sided pull:
 //
-//   - The last 4 hours' move is damped by 10%: after a sharp 4-hour
-//     fall the median next 4 hours sit a little above the checkpoint,
-//     and after a sharp rise a little below it. The correlation of the
-//     past 240-minute return with the next is about -0.33 on the kit's
-//     practice window, and the sign holds, weakly, on three weeks of
-//     Binance BTC/USDT 1-minute closes.
+//   - A past 4-hour RISE is reversed by 35%: after a sharp rise the
+//     median next 4 hours sit below the checkpoint. A past FALL is not
+//     reversed at all: in the falling market the falls keep drifting
+//     down, so forecasting up after a fall loses. This asymmetry is the
+//     whole v2 change over v1 (which damped both directions by 10%):
+//     it is monotone across the whole grid (k_up 0.10 -> 0.50 improves
+//     every validation set; k_down -0.10 -> +0.10 barely matters), and
+//     0.35 sits mid-plateau (0.30-0.50 all score within half a percent
+//     of each other on the broad samples), so it is not a tuned spike.
 //   - The price is pulled 10% of the way toward its 12-hour exponential
-//     average, the same mean-reversion idea on a slower clock.
+//     average, but only DOWNWARD: when the price sits above its EMA the
+//     guess steps down toward it; when it sits below, there is no pull
+//     up, because in the downtrend the EMA sits above the price and
+//     pulling up fights the drift. Pulling both ways (v1) loses 2.7%
+//     to persistence on the most recent Binance regime (12-14 Nov);
+//     the one-sided pull beats persistence there.
 //
-// Each signal alone beats persistence by about 2% on both validation
-// samples; averaging the two keeps either one from dominating when the
-// regime turns, and the blend's parameters sit on a flat plateau
-// (neighbouring dampings 0.08-0.12 and pulls 0.08-0.12 all score within
-// half a percent of each other), so nothing here is a tuned spike.
+// The guess is therefore never above the checkpoint's own close: this
+// entry sells the bounce and never buys the dip. If the final 48 hours
+// turn into a sharp V-shaped recovery, that bet costs it; if they stay
+// choppy or keep drifting down, as the last week has, it is the side
+// the data supports.
 //
 // Validation (local estimates only; the practice window is not the final):
 //   - Kit practice, 6 cases p00-p05 (p05's target recovered from the
 //     baseline's stated practice score plus a Binance cross-check):
-//     MAE 44,688 cents vs the persistence baseline's 44,522 (about even;
-//     six cases is too few to separate a 2% edge).
+//     MAE 42,840 cents vs persistence 44,522 (3.8% better) and vs
+//     v1's 44,688 (4.1% better). v1 was WORSE than persistence here.
 //   - Walk-forward inside the kit's own 72-hour windows, checkpoints
 //     every 60 minutes over the last 48 hours of each case (264 points):
-//     MAE 44,111 cents vs persistence 45,117 (about 2.2% better).
+//     MAE 43,479 cents vs persistence 45,117 (3.6% better) and vs
+//     v1's 44,111 (1.4% better).
 //   - Binance BTC/USDT 1-minute closes, 25 Oct-14 Nov 2026, checkpoints
-//     every 4 hours with a 72-hour lookback (106 points, trending and
-//     choppy weeks alike): MAE 47,350 cents vs persistence 48,252
-//     (about 1.9% better), better than persistence on 13 of 18 days and
-//     never worse than 1.11x on any single day.
-//   - The aggressive version of this idea (damping the 24-hour move by
-//     20-30%) wins 10% on the kit window but loses 20-30% on the Binance
-//     window, so it was rejected: the edge in the practice window is
-//     regime-specific, and this entry does not chase it.
+//     every 4 hours with a 72-hour lookback (106 points): MAE 47,480
+//     cents vs persistence 48,252 (1.6% better); v1 scored 47,350
+//     here, a touch better, within noise.
+//   - Binance Nov 8-14 (the recent regime, 160 points, every 60 min):
+//     MAE 47,282 cents vs persistence 48,071 (1.6% better) and vs
+//     v1's 48,148 (1.8% better). v1 was WORSE than persistence here.
+//   - Binance every 60 minutes, full 25 Oct-14 Nov (448 points):
+//     MAE 46,509 cents vs persistence 47,113 (1.3% better) and vs
+//     v1's 46,949 (0.9% better).
+//   - Paired bootstrap (2,000 resamples) on the pooled kit + recent
+//     Binance checkpoints: v2 vs persistence 0.972, 95% CI [0.960,
+//     0.983]; v2 vs v1 0.984, 95% CI [0.972, 0.997].
+//   - The edge is broad, not one lucky case: v2 deviates from
+//     persistence on about half the walk-forward checkpoints (52% kit,
+//     46% recent Binance, 54% all Binance), and on those points it
+//     beats persistence by 7.1% (kit), 5.1% (recent Binance) and
+//     2.9% (all Binance). The 6-case practice improvement happens to
+//     come mostly from one case (p04); the walk-forward sets are the
+//     real evidence.
+//   - So v2 beats persistence on ALL FIVE validation sets (worst
+//     0.987) and beats v1 on four of five; v1 failed two of five.
+//
+// Ideas tried and rejected, so the entry does not chase them:
+//   - Smoothing the anchor (median of the last 3/5/10/30 closes, or a
+//     short EMA): worse everywhere. The pool close is already a median
+//     of samples and carries no usable transient noise.
+//   - A 24-hour trend term (extra damping of the 1,440-minute move):
+//     wins 5% on the kit window but loses 4-8% on Binance. Regime
+//     specific, rejected the same way v1 rejected the aggressive
+//     24-hour damping.
+//   - Longer EMA pulls (EMA 1,440 / 2,880): worse on the recent regime,
+//     where the slow averages lag the crash.
+//   - A constant downward drift (-5 to -15 bp per 4 hours): helps the
+//     kit window and the crash days but pushes the broad Binance score
+//     to 1.002 and worse. It fits the sample mean of a falling market,
+//     not a signal. Rejected.
+//   - An extra 60-minute up-reversion term: flat, no consistent gain.
+//   - Trend-following (positive damping): loses 4-25% on Binance.
+//
+// Honest expectation: the edge over persistence is thin, about 1.5-2.5%,
+// and with only 12 final cases luck still dominates. But v2 is the first
+// version that beats the baseline on every validation set, including
+// the most recent regime the final directly follows, while v1 loses
+// there. That is the whole case for replacing v1.
 //
 // The program is a pure function of the case's prices: no clock, no
 // randomness, no network, no I/O beyond reading the case and writing the
@@ -71,11 +116,13 @@ const MAX_PRICE = 9_999_999.99999;
 
 /** Minutes of past move the trend signal damps: the forecast horizon. */
 const TREND_WINDOW_MIN = 240;
-/** Fraction of the last 4 hours' log-move the trend signal reverses. */
-const TREND_DAMP = 0.1;
+/** Fraction of a past 4-hour RISE the trend signal reverses. */
+const TREND_DAMP_UP = 0.35;
+/** Fraction of a past 4-hour FALL the trend signal reverses: none. */
+const TREND_DAMP_DOWN = 0.0;
 /** Span, in minutes, of the exponential average the pull signal uses. */
 const EMA_SPAN_MIN = 720;
-/** Fraction of the distance to the EMA the pull signal closes. */
+/** Fraction of the (downward-only) distance to the EMA the pull closes. */
 const EMA_PULL = 0.1;
 
 interface CaseMarket {
@@ -101,13 +148,14 @@ function emaLast(prices: number[], span: number): number {
 }
 
 /**
- * The forecast for one market: the average of two mild mean-reversion
- * signals, each a small step back from the checkpoint's own close.
- * With fewer than TREND_WINDOW_MIN + 1 closes there is no past move to
- * damp, so the guess is the checkpoint's own close (persistence).
- * Any unusable input falls back to a still-valid guess instead of
- * crashing: a crashed case is scored as invalid, and an entry with any
- * invalid case ranks below every valid one and takes no prize.
+ * The forecast for one market: the average of two mild, one-sided
+ * mean-reversion signals, each a small step down from the checkpoint's
+ * own close, never up. With fewer than TREND_WINDOW_MIN + 1 closes
+ * there is no past move to damp, so the guess is the checkpoint's own
+ * close (persistence). Any unusable input falls back to a still-valid
+ * guess instead of crashing: a crashed case is scored as invalid, and
+ * an entry with any invalid case ranks below every valid one and takes
+ * no prize.
  */
 function forecast(m: CaseMarket): number {
   if (!Array.isArray(m.prices) || m.prices.length === 0) return price5(1);
@@ -115,9 +163,16 @@ function forecast(m: CaseMarket): number {
   if (typeof last !== 'number' || !Number.isFinite(last) || last <= 0) return price5(1);
   if (m.prices.length <= TREND_WINDOW_MIN) return price5(last);
   const past = m.prices[m.prices.length - 1 - TREND_WINDOW_MIN] as number;
-  const pull = last + EMA_PULL * (emaLast(m.prices, EMA_SPAN_MIN) - last);
+  // Pull toward the 12-hour EMA only downward: when the price sits above
+  // its EMA the guess steps 10% of the way down; when it sits below,
+  // there is no pull up.
+  const pull = last + EMA_PULL * Math.min(0, emaLast(m.prices, EMA_SPAN_MIN) - last);
   if (typeof past !== 'number' || !Number.isFinite(past) || past <= 0) return price5(pull);
-  const trend = last * Math.exp(-TREND_DAMP * Math.log(last / past));
+  // Asymmetric damping: a past rise is reversed by 35%, a past fall not
+  // at all, so the trend signal never forecasts above the checkpoint.
+  const r = Math.log(last / past);
+  const damp = r >= 0 ? TREND_DAMP_UP : TREND_DAMP_DOWN;
+  const trend = last * Math.exp(-damp * r);
   return price5((trend + pull) / 2);
 }
 
